@@ -8,8 +8,6 @@ github.com/MaxDillon/age-filestore v0.0.7 h1:kAriB3e8Ytpfp06nsO8370vDc42jWRpqm1K
 github.com/MaxDillon/age-filestore v0.0.7/go.mod h1:Yg2GJl3TFQ7ecRHNfJHq/95sZvnthTL6bNVoBBlBTHk=
 github.com/MaxDillon/daemonizer v0.0.1 h1:9sPj5zo4iZ3YCZJtOSPppbTgNhqm6nFl4doxlCAOIPc=
 github.com/MaxDillon/daemonizer v0.0.1/go.mod h1:Qr8YGkPlDaavlLTn6hixT44amK3KVDW41v9wV4Xfi3w=
-github.com/a-h/templ v0.3.1001 h1:yHDTgexACdJttyiyamcTHXr2QkIeVF1MukLy44EAhMY=
-github.com/a-h/templ v0.3.1001/go.mod h1:oCZcnKRf5jjsGpf2yELzQfodLphd2mwecwG4Crk5HBo=
 golang.org/x/crypto v0.49.0 h1:+Ng2ULVvLHnJ/ZFEq4KdcDd/cfjrrjjNSXNzxg0Y4U4=
 golang.org/x/crypto v0.49.0/go.mod h1:ErX4dUh2UM+CFYiXZRTcMpEcN8b/1gxEuv3nODoYtCA=
 golang.org/x/sys v0.42.0 h1:omrd2nAlyT5ESRdCLYdm3+fMfNFE/+Rf4bDIQImRJeo=

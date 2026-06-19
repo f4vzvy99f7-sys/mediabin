@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"slices"
@@ -12,8 +14,10 @@ import (
 	"time"
 
 	agefs "github.com/MaxDillon/age-filestore/store"
-	"github.com/MaxDillon/mediabin-golang/web"
 )
+
+//go:embed www
+var staticFS embed.FS
 
 const maxVideoChunk = 1 << 20 // 1 MB, matches Python implementation
 
@@ -142,17 +146,8 @@ func startHTTPServer(ctx context.Context, ledger *Ledger, s agefs.Store, port st
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/media/list", srv.handleListMedia)
 	mux.HandleFunc("GET /api/media/play/{id}", srv.handlePlayMedia)
-	mux.HandleFunc("GET /web", func(w http.ResponseWriter, r *http.Request) {
-		var videos []web.VideoData
-		for _, media := range ledger.entries {
-			videos = append(videos, web.VideoData{
-				Id:    media.ID,
-				Title: media.Title,
-				Tags:  media.Tags,
-			})
-		}
-		web.Videos(videos).Render(r.Context(), w)
-	})
+	webRoot, _ := fs.Sub(staticFS, "www")
+	mux.Handle("GET /", http.FileServer(http.FS(webRoot)))
 
 	addr := fmt.Sprintf(":%s", port)
 	server := &http.Server{Addr: addr, Handler: mux}

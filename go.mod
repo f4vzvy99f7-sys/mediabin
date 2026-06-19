@@ -11,7 +11,4 @@ require (
 	golang.org/x/term v0.41.0
 )
 
-require (
-	filippo.io/hpke v0.4.0 // indirect
-	github.com/a-h/templ v0.3.1001 // indirect
-)
+require filippo.io/hpke v0.4.0 // indirect
