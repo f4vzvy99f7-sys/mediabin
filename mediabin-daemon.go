@@ -12,9 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"filippo.io/age"
-	agefs "github.com/MaxDillon/age-filestore/store"
 	"github.com/MaxDillon/daemonizer/daemon"
+	vault "github.com/f4vzvy99f7-sys/vaultblob-go"
 )
 
 type ProcessInfo struct {
@@ -99,16 +98,14 @@ func InitMediabin() (*MediabinDaemon, error) {
 			}
 		}
 
-		identity, err := age.NewScryptIdentity(passwd)
-		if err != nil {
-			return fmt.Errorf("failed to create age identity: %w", err)
+		vaultDir := filepath.Join(datadir, "vault")
+		if err := os.MkdirAll(vaultDir, 0755); err != nil {
+			return fmt.Errorf("failed to create vault dir: %w", err)
 		}
-		mss, err := agefs.New(agefs.Config{
-			Root:       datadir,
-			Identities: []age.Identity{identity},
-		})
+		mk := deriveVaultKey(passwd)
+		session, err := vault.OpenVault(vaultDir, mk, nil)
 		if err != nil {
-			return fmt.Errorf("failed to open media store: %w", err)
+			return fmt.Errorf("failed to open vault: %w", err)
 		}
 
 		serverCtx, cancelServerCtx := context.WithCancel(context.Background())
@@ -120,7 +117,7 @@ func InitMediabin() (*MediabinDaemon, error) {
 		h.OnShutdown(func(ctx context.Context) error {
 			logger.Println("shutting down...")
 			cancelServerCtx()
-			mss.Close() //nolint:errcheck
+			session.Close()
 			if err := ledger.SyncToFile(ledgerpath); err != nil {
 				logger.Printf("failed to sync ledger on shutdown: %v", err)
 				return err
@@ -134,7 +131,7 @@ func InitMediabin() (*MediabinDaemon, error) {
 		}
 
 		downloader := NewDownloader(serverCtx, logger.Writer())
-		startHTTPServer(serverCtx, ledger, mss, port, logger)
+		startHTTPServer(serverCtx, ledger, session, port, logger)
 
 		go func() {
 			c := downloader.Subscribe()
@@ -146,8 +143,9 @@ func InitMediabin() (*MediabinDaemon, error) {
 						logger.Printf("download finished but entry not found: %s", event.TaskID)
 						continue
 					}
-					if err := storeInAgeFS(datadir, passwd, entry.ID, event.TempDir); err != nil {
-						logger.Printf("failed to store download in age-fs: %v", err)
+					principleName, err := storeInVaultblob(session, entry.ID, event.TempDir)
+					if err != nil {
+						logger.Printf("failed to store download in vault: %v", err)
 						entry.Status = "error"
 						ledger.Update(entry)
 						if err := ledger.SyncToFile(ledgerpath); err != nil {
@@ -157,6 +155,7 @@ func InitMediabin() (*MediabinDaemon, error) {
 					}
 					now := time.Now()
 					entry.Status = "complete"
+					entry.ObjectPath = principleName
 					entry.TimestampInstalled = &now
 					ledger.Update(entry)
 					if err := ledger.SyncToFile(ledgerpath); err != nil {
@@ -202,7 +201,6 @@ func InitMediabin() (*MediabinDaemon, error) {
 						if entry.Status == "pending" {
 							if err := downloader.StartDownload(serverCtx, entry.ID, entry.OriginUrl); err != nil {
 								if errors.Is(err, ErrAlreadyDownloading) {
-									// Worker already has this task; nothing to do.
 									continue
 								}
 								logger.Printf("failed to start download %s: %v", entry.ID, err)
@@ -213,7 +211,6 @@ func InitMediabin() (*MediabinDaemon, error) {
 								}
 								continue
 							}
-							// Mark as downloading so the dispatcher ignores it on future ticks.
 							entry.Status = "downloading"
 							ledger.Update(entry)
 							logger.Printf("started download: %s", entry.ID)
@@ -231,7 +228,6 @@ func InitMediabin() (*MediabinDaemon, error) {
 				return err
 			}
 
-			// Duplicate check using the stable MD5 identifier.
 			if _, exists := ledger.Get(info.MbIdentifier); exists {
 				fmt.Fprintf(stdout, "%s is already downloaded or is currently in the queue\n", url)
 				return nil
@@ -246,12 +242,11 @@ func InitMediabin() (*MediabinDaemon, error) {
 				OriginUrl:    info.WebpageURL,
 				VideoUrl:     info.URL,
 				ThumbnailUrl: info.Thumbnail,
-				ObjectPath:   info.MbPath,
+				ObjectPath:   "", // will be set after download
 				Status:       "pending",
 				Tags:         []string{},
 			}
 
-			// Auto-tag uploader as studio and cast as actors, matching Python behaviour.
 			if info.Uploader != "" {
 				entry.Tags = append(entry.Tags, "studio:"+normalizeTagValue(info.Uploader))
 			}
@@ -268,7 +263,6 @@ func InitMediabin() (*MediabinDaemon, error) {
 		})
 
 		h.Handle("ListCurrentProcs", func(ctx context.Context) (ListCurrentProcsResp, error) {
-			// Build a set of IDs that are actively downloading.
 			activeTasks := downloader.GetActiveTasks()
 			activeByID := make(map[string]TaskSnapshot, len(activeTasks))
 			for _, t := range activeTasks {
@@ -277,10 +271,6 @@ func InitMediabin() (*MediabinDaemon, error) {
 
 			var procs []ProcessInfo
 
-			// Actively downloading tasks get their live progress.
-			// task.Metadata (and thus task.Title) is only populated after the download
-			// finishes; during the download itself the title comes from the ledger entry
-			// that was created by RegisterNewDownload.
 			for _, t := range activeTasks {
 				title := t.Title
 				if title == "" {
@@ -299,7 +289,6 @@ func InitMediabin() (*MediabinDaemon, error) {
 				})
 			}
 
-			// All pending ledger entries that are not yet in the active set.
 			for _, entry := range ledger.List() {
 				if entry.Status != "pending" {
 					continue
@@ -323,7 +312,6 @@ func InitMediabin() (*MediabinDaemon, error) {
 			title_lower := strings.ToLower(title_like)
 
 			for _, entry := range entries {
-				// Only show completed entries, matching Python behaviour.
 				if entry.Status != "complete" {
 					continue
 				}
@@ -331,7 +319,6 @@ func InitMediabin() (*MediabinDaemon, error) {
 					continue
 				}
 				if len(tags) > 0 {
-					// OR logic: entry must have at least one of the specified tags.
 					matched := false
 					for _, tag := range tags {
 						for _, et := range entry.Tags {
@@ -409,74 +396,52 @@ func InitMediabin() (*MediabinDaemon, error) {
 	})
 }
 
-// normalizeTagValue lower-cases a string and replaces spaces with underscores,
-// matching Python's tag normalization: uploader.lower().replace(' ', '_').
 func normalizeTagValue(s string) string {
 	return strings.ToLower(strings.ReplaceAll(s, " ", "_"))
 }
 
-// storeInAgeFS encrypts all files from a completed yt-dlp download directory
-// into the age-filesystem archive for the given hash, then removes the temp dir.
+// storeInVaultblob stores all files from a completed yt-dlp download directory
+// into the vault as individual files, removes the temp dir, and returns the
+// vaultblob file ID (hex string) for the principle video file.
 //
-// File mapping:
-//   - video.info.json  → meta.json  (sidecar)
-//   - video.{video ext} → principle  (auto-detected MIME → principle.{ext})
-//   - everything else  → thumbnail.{ext} (sidecar)
-func storeInAgeFS(datadir, passphrase, hash, tempDir string) error {
+// Each stored file gets a deterministic 16-byte vaultblob FileId derived from
+// the entry ID and a purpose string (meta/principle/thumbnail) via SHA256.
+func storeInVaultblob(session *vault.Session, id, tempDir string) (string, error) {
 	des, err := os.ReadDir(tempDir)
 	if err != nil {
-		return fmt.Errorf("read temp dir: %w", err)
+		return "", fmt.Errorf("read temp dir: %w", err)
 	}
 
-	// Open all files before calling Put so they are all readable during the
-	// single encrypt pass.
-	type openedFile struct {
-		f    *os.File
-		name string // archive name ("" = principle auto-detect)
-	}
+	var principleID string
 
-	opened := make([]openedFile, 0, len(des))
 	for _, de := range des {
 		if de.IsDir() {
 			continue
 		}
 		src := filepath.Join(tempDir, de.Name())
-		f, err := os.Open(src)
+		data, err := os.ReadFile(src)
 		if err != nil {
-			for _, o := range opened {
-				o.f.Close()
-			}
-			return fmt.Errorf("open %s: %w", de.Name(), err)
+			return "", fmt.Errorf("read %s: %w", de.Name(), err)
 		}
-		var archiveName string
+
+		var fileID string
 		switch {
 		case de.Name() == "video.info.json":
-			archiveName = "meta.json"
+			fileID = deriveFileID(id, "meta")
 		case isVideoExt(strings.ToLower(filepath.Ext(de.Name()))):
-			archiveName = "" // principle — MIME auto-detected by store.Put
+			principleID = deriveFileID(id, "principle")
+			fileID = principleID
 		default:
-			archiveName = "thumbnail" + strings.ToLower(filepath.Ext(de.Name()))
+			fileID = deriveFileID(id, "thumbnail")
 		}
-		opened = append(opened, openedFile{f: f, name: archiveName})
-	}
 
-	putFiles := make([]agefs.PutFile, len(opened))
-	for i, o := range opened {
-		putFiles[i] = agefs.PutFile{Name: o.name, Reader: o.f}
-	}
-
-	putErr := agefs.Put(datadir, hash, passphrase, putFiles)
-
-	for _, o := range opened {
-		o.f.Close()
-	}
-
-	if putErr != nil {
-		return putErr
+		if _, err := session.PutFileWithID(data, fileID); err != nil {
+			return "", fmt.Errorf("store %s: %w", fileID, err)
+		}
 	}
 
 	os.RemoveAll(tempDir)
-	return nil
+	return principleID, nil
 }
 
 func isVideoExt(ext string) bool {

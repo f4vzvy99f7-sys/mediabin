@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	agefs "github.com/MaxDillon/age-filestore/store"
+	vault "github.com/f4vzvy99f7-sys/vaultblob-go"
 )
 
 //go:embed www
@@ -22,9 +22,9 @@ var staticFS embed.FS
 const maxVideoChunk = 1 << 20 // 1 MB, matches Python implementation
 
 type apiServer struct {
-	ledger *Ledger
-	store  agefs.Store
-	logger *log.Logger
+	ledger  *Ledger
+	session *vault.Session
+	logger  *log.Logger
 }
 
 type mediaListItem struct {
@@ -91,30 +91,29 @@ func (s *apiServer) handlePlayMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stat first to get the principle filename (needed for Content-Type).
-	he, err := s.store.Stat(id)
-	if err != nil || he.Principle == nil {
-		http.NotFound(w, r)
+	if entry.ObjectPath == "" {
+		http.Error(w, "no principle file recorded", http.StatusNotFound)
 		return
 	}
 
-	rc, size, err := s.store.Open(id, he.Principle.Name)
+	fileID := entry.ObjectPath
+
+	size, err := s.session.FileSize(fileID)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	defer rc.Close()
 
-	start, requestedEnd := parseRangeHeader(r, size)
-	cappedEnd := min(start+maxVideoChunk-1, requestedEnd, size-1)
+	rc := s.session.NewFileReadSeeker(fileID)
+
+	start, requestedEnd := parseRangeHeader(r, int64(size))
+	cappedEnd := min(start+maxVideoChunk-1, requestedEnd, int64(size)-1)
 
 	req := r.Clone(r.Context())
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, cappedEnd))
-	http.ServeContent(w, req, he.Principle.Name, time.Time{}, rc)
+	http.ServeContent(w, req, fileID, time.Time{}, rc)
 }
 
-// parseRangeHeader extracts the start and end byte positions from a Range header.
-// If the header is absent or malformed, it returns 0 and fileSize-1 (full file).
 func parseRangeHeader(r *http.Request, fileSize int64) (start, end int64) {
 	end = fileSize - 1
 	rangeHeader := r.Header.Get("Range")
@@ -140,8 +139,8 @@ func parseRangeHeader(r *http.Request, fileSize int64) (start, end int64) {
 	return
 }
 
-func startHTTPServer(ctx context.Context, ledger *Ledger, s agefs.Store, port string, logger *log.Logger) {
-	srv := &apiServer{ledger: ledger, store: s, logger: logger}
+func startHTTPServer(ctx context.Context, ledger *Ledger, session *vault.Session, port string, logger *log.Logger) {
+	srv := &apiServer{ledger: ledger, session: session, logger: logger}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/media/list", srv.handleListMedia)
