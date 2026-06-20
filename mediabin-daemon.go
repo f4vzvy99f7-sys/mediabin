@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -321,11 +322,8 @@ func InitMediabin() (*MediabinDaemon, error) {
 				if len(tags) > 0 {
 					matched := false
 					for _, tag := range tags {
-						for _, et := range entry.Tags {
-							if et == tag {
-								matched = true
-								break
-							}
+						if slices.Contains(entry.Tags, tag) {
+							matched = true
 						}
 						if matched {
 							break
