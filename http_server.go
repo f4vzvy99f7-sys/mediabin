@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
-	"log"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/f4vzvy99f7-sys/daemonizer"
 	vault "github.com/f4vzvy99f7-sys/vaultblob-go"
 )
 
@@ -24,7 +24,7 @@ const maxVideoChunk = 1 << 20 // 1 MB, matches Python implementation
 type apiServer struct {
 	ledger  *Ledger
 	session *vault.Session
-	logger  *log.Logger
+	logger  *daemonizer.Logger
 }
 
 type mediaListItem struct {
@@ -139,7 +139,7 @@ func parseRangeHeader(r *http.Request, fileSize int64) (start, end int64) {
 	return
 }
 
-func startHTTPServer(ctx context.Context, ledger *Ledger, session *vault.Session, port string, logger *log.Logger) {
+func startHTTPServer(ctx context.Context, ledger *Ledger, session *vault.Session, port string, logger *daemonizer.Logger) {
 	srv := &apiServer{ledger: ledger, session: session, logger: logger}
 
 	mux := http.NewServeMux()
@@ -157,9 +157,9 @@ func startHTTPServer(ctx context.Context, ledger *Ledger, session *vault.Session
 	}()
 
 	go func() {
-		logger.Printf("HTTP API listening on %s", addr)
+		logger.Infof("HTTP API listening on %s", addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Printf("HTTP server error: %v", err)
+			logger.Infof("HTTP server error: %v", err)
 		}
 	}()
 }

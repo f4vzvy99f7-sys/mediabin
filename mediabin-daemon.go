@@ -58,7 +58,7 @@ type MediabinDaemon struct {
 }
 
 var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *MediabinDaemon, config map[string]string) (daemonizer.CleanupFunc, error) {
-	logger := daemonizer.Logger()
+	logger := daemonizer.Log()
 
 	passwd, ok := config["password"]
 	if !ok {
@@ -88,7 +88,7 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 			entry.Status = "pending"
 			ledger.Update(entry)
 			needsSync = true
-			logger.Printf("reset interrupted download to pending: %s", entry.ID)
+			logger.Infof("reset interrupted download to pending: %s", entry.ID)
 		}
 	}
 	if needsSync {
@@ -114,7 +114,7 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 		port = "8080"
 	}
 
-	downloader := NewDownloader(serverCtx, logger.Writer())
+	downloader := NewDownloader(serverCtx, logger.Writer(daemonizer.LogLevelDebug))
 	startHTTPServer(serverCtx, ledger, session, port, logger)
 
 	go func() {
@@ -124,16 +124,16 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 			case StatusFinished:
 				entry, ok := ledger.Get(event.TaskID)
 				if !ok {
-					logger.Printf("download finished but entry not found: %s", event.TaskID)
+					logger.Infof("download finished but entry not found: %s", event.TaskID)
 					continue
 				}
 				principleName, err := storeInVaultblob(session, entry.ID, event.TempDir)
 				if err != nil {
-					logger.Printf("failed to store download in vault: %v", err)
+					logger.Infof("failed to store download in vault: %v", err)
 					entry.Status = "error"
 					ledger.Update(entry)
 					if err := ledger.SyncToFile(ledgerpath); err != nil {
-						logger.Printf("failed to sync ledger after store error: %v", err)
+						logger.Infof("failed to sync ledger after store error: %v", err)
 					}
 					continue
 				}
@@ -143,9 +143,9 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 				entry.TimestampInstalled = &now
 				ledger.Update(entry)
 				if err := ledger.SyncToFile(ledgerpath); err != nil {
-					logger.Printf("failed to sync ledger after completion: %v", err)
+					logger.Infof("failed to sync ledger after completion: %v", err)
 				}
-				logger.Printf("download completed and encrypted: %s", event.TaskID)
+				logger.Infof("download completed and encrypted: %s", event.TaskID)
 
 			case StatusError:
 				entry, ok := ledger.Get(event.TaskID)
@@ -153,9 +153,9 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 					entry.Status = "error"
 					ledger.Update(entry)
 					if err := ledger.SyncToFile(ledgerpath); err != nil {
-						logger.Printf("failed to sync ledger after error: %v", err)
+						logger.Infof("failed to sync ledger after error: %v", err)
 					}
-					logger.Printf("download error: %s - %v", event.TaskID, event.Error)
+					logger.Infof("download error: %s - %v", event.TaskID, event.Error)
 				}
 			case StatusCancelled:
 				entry, ok := ledger.Get(event.TaskID)
@@ -163,9 +163,9 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 					entry.Status = "error"
 					ledger.Update(entry)
 					if err := ledger.SyncToFile(ledgerpath); err != nil {
-						logger.Printf("failed to sync ledger after cancel: %v", err)
+						logger.Infof("failed to sync ledger after cancel: %v", err)
 					}
-					logger.Printf("download cancelled: %s", event.TaskID)
+					logger.Infof("download cancelled: %s", event.TaskID)
 				}
 			}
 		}
@@ -187,17 +187,17 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 							if errors.Is(err, ErrAlreadyDownloading) {
 								continue
 							}
-							logger.Printf("failed to start download %s: %v", entry.ID, err)
+							logger.Infof("failed to start download %s: %v", entry.ID, err)
 							entry.Status = "error"
 							ledger.Update(entry)
 							if err := ledger.SyncToFile(ledgerpath); err != nil {
-								logger.Printf("failed to sync ledger after dispatch error: %v", err)
+								logger.Infof("failed to sync ledger after dispatch error: %v", err)
 							}
 							continue
 						}
 						entry.Status = "downloading"
 						ledger.Update(entry)
-						logger.Printf("started download: %s", entry.ID)
+						logger.Infof("started download: %s", entry.ID)
 					}
 				}
 			}
@@ -207,7 +207,7 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 	impl.RegisterNewDownload = func(url string, stdout daemonizer.Writer) error {
 		info, err := downloader.FetchInfo(ctx, url)
 		if err != nil {
-			logger.Printf("error fetching info: %v", err)
+			logger.Infof("error fetching info: %v", err)
 			return err
 		}
 
@@ -217,7 +217,7 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 		}
 
 		fmt.Fprintf(stdout, "Queued: %s\n", info.Title)
-		logger.Printf("Title: %s\n Url: %s\n", info.Title, info.WebpageURL)
+		logger.Infof("Title: %s\n Url: %s\n", info.Title, info.WebpageURL)
 
 		entry := MediaEntry{
 			ID:           info.MbIdentifier,
@@ -239,7 +239,7 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 
 		ledger.Add(entry)
 		if err := ledger.SyncToFile(ledgerpath); err != nil {
-			logger.Printf("failed to sync ledger after register: %v", err)
+			logger.Infof("failed to sync ledger after register: %v", err)
 			return err
 		}
 		return nil
@@ -373,11 +373,11 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 	}
 
 	return func() {
-		logger.Println("shutting down...")
+		logger.Info("shutting down")
 		cancelServerCtx()
 		session.Close()
 		if err := ledger.SyncToFile(ledgerpath); err != nil {
-			logger.Printf("failed to sync ledger on shutdown: %v", err)
+			logger.Infof("failed to sync ledger on shutdown: %v", err)
 			return
 		}
 	}, nil

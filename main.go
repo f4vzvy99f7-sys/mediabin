@@ -60,7 +60,7 @@ func main() {
 			"datadir":  dataDir,
 			"port":     *portFlag,
 		}
-		if err := Daemon.Start(env, nil); err != nil {
+		if err := Daemon.Start(env, &daemonizer.StartupOptions{LogLevel: daemonizer.LogLevelInfo}); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
