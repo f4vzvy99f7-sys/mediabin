@@ -47,8 +47,10 @@ type DiskUsageResp struct {
 	FreeBytes  uint64
 }
 
+var ErrDownloadUrlExists = errors.New("url is already downloaded or is currently in the queue")
+
 type MediabinDaemon struct {
-	RegisterNewDownload func(url string, stdout daemonizer.Writer) error
+	RegisterNewDownload func(url string) (*MediaEntry, error)
 	ListCurrentProcs    func() (ListCurrentProcsResp, error)
 	ListMedia           func(title_like string, tags []string) (ListMediaResp, error)
 	ListTags            func() ([]string, error)
@@ -204,19 +206,17 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 		}
 	}()
 
-	impl.RegisterNewDownload = func(url string, stdout daemonizer.Writer) error {
+	impl.RegisterNewDownload = func(url string) (*MediaEntry, error) {
 		info, err := downloader.FetchInfo(ctx, url)
 		if err != nil {
 			logger.Infof("error fetching info: %v", err)
-			return err
+			return nil, err
 		}
 
 		if _, exists := ledger.Get(info.MbIdentifier); exists {
-			fmt.Fprintf(stdout, "%s is already downloaded or is currently in the queue\n", url)
-			return nil
+			return nil, ErrDownloadUrlExists
 		}
 
-		fmt.Fprintf(stdout, "Queued: %s\n", info.Title)
 		logger.Infof("Title: %s\n Url: %s\n", info.Title, info.WebpageURL)
 
 		entry := MediaEntry{
@@ -240,9 +240,9 @@ var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *Me
 		ledger.Add(entry)
 		if err := ledger.SyncToFile(ledgerpath); err != nil {
 			logger.Infof("failed to sync ledger after register: %v", err)
-			return err
+			return nil, err
 		}
-		return nil
+		return &entry, nil
 	}
 
 	impl.ListCurrentProcs = func() (ListCurrentProcsResp, error) {

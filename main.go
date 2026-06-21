@@ -93,7 +93,7 @@ func main() {
 		if len(os.Args) > 2 {
 			url = os.Args[2]
 		}
-		if err := Daemon.Client.RegisterNewDownload(url, daemonizer.Wrap(os.Stdout)); err != nil {
+		if _, err := Daemon.Client.RegisterNewDownload(url); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -106,7 +106,7 @@ func main() {
 				fmt.Print("> ")
 				continue
 			}
-			if err := Daemon.Client.RegisterNewDownload(url, daemonizer.Wrap(os.Stdout)); err != nil {
+			if _, err := Daemon.Client.RegisterNewDownload(url); err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			}
 			fmt.Print("> ")
