@@ -1,15 +1,14 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/MaxDillon/daemonizer/daemon"
-	"golang.org/x/crypto/ssh/terminal"
+	"github.com/f4vzvy99f7-sys/daemonizer"
+	"golang.org/x/term"
 )
 
 // stringSlice is a flag.Value that accumulates multiple -t/--tag values.
@@ -21,19 +20,7 @@ func (s *stringSlice) Set(v string) error {
 	return nil
 }
 
-func requireDaemon(clientErr error, cmd string) {
-	if clientErr != nil {
-		fmt.Fprintf(os.Stderr, "daemon is not running — use '%s start' to start it\n", os.Args[0])
-		os.Exit(1)
-	}
-}
-
 func main() {
-	if os.Getenv("__DAEMON_SERVICE") != "" {
-		InitMediabin()
-		return
-	}
-
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "usage: %s <start|stop|i|ps|ls|tags|du|logs> [args...]\n", os.Args[0])
 		os.Exit(1)
@@ -41,16 +28,9 @@ func main() {
 
 	cmd := os.Args[1]
 
-	client, clientErr := InitMediabin()
-
-	if clientErr != nil && !errors.Is(clientErr, daemon.ErrNotRunning) {
-		fmt.Fprintf(os.Stderr, "error: %v\n", clientErr)
-		os.Exit(1)
-	}
-
 	switch cmd {
 	case "start":
-		if clientErr == nil {
+		if Daemon.IsRunning() {
 			fmt.Println("daemon already running")
 			return
 		}
@@ -67,7 +47,7 @@ func main() {
 		}
 
 		fmt.Print("Enter password: ")
-		password, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+		password, err := term.ReadPassword(int(os.Stdin.Fd()))
 		if err != nil {
 			var passwordStr string
 			fmt.Scanln(&passwordStr)
@@ -76,11 +56,11 @@ func main() {
 		fmt.Println()
 
 		env := map[string]string{
-			"DB_PASSWD":  string(password),
-			"DB_DATADIR": dataDir,
-			"DB_PORT":    *portFlag,
+			"password": string(password),
+			"datadir":  dataDir,
+			"port":     *portFlag,
 		}
-		if err := daemon.Start(client, env); err != nil {
+		if err := Daemon.Start(env, nil); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -88,31 +68,36 @@ func main() {
 		return
 
 	case "stop":
-		if clientErr != nil {
+		if !Daemon.IsRunning() {
 			fmt.Fprintf(os.Stderr, "daemon is not running\n")
 			os.Exit(1)
 		}
-		if err := daemon.Stop(client); err != nil {
+		if err := Daemon.Stop(); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
 		fmt.Println("daemon stopped")
 		return
+	}
+
+	if !Daemon.IsRunning() {
+		fmt.Fprintf(os.Stderr, "daemon is not running — use '%s start' to start it\n", os.Args[0])
+		os.Exit(1)
+	}
+
+	switch cmd {
 
 	case "i", "install":
-		requireDaemon(clientErr, cmd)
 		url := ""
 		if len(os.Args) > 2 {
 			url = os.Args[2]
 		}
-		if err := client.RegisterNewDownload(url); err != nil {
+		if err := Daemon.Client.RegisterNewDownload(url, daemonizer.Wrap(os.Stdout)); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
 
 	case "ls":
-		requireDaemon(clientErr, cmd)
-
 		lsFlags := flag.NewFlagSet("ls", flag.ExitOnError)
 		idsOnly := lsFlags.Bool("ids", false, "print IDs only")
 		query := lsFlags.String("q", "", "filter by title (case-insensitive, partial match)")
@@ -122,7 +107,7 @@ func main() {
 		lsFlags.Var(&tags, "tag", "filter by tag (can be specified multiple times)")
 		lsFlags.Parse(os.Args[2:])
 
-		resp, err := client.ListMedia(*query, []string(tags))
+		resp, err := Daemon.Client.ListMedia(*query, []string(tags))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
@@ -146,8 +131,7 @@ func main() {
 		}
 
 	case "tags":
-		requireDaemon(clientErr, cmd)
-		tags, err := client.ListTags()
+		tags, err := Daemon.Client.ListTags()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
@@ -167,8 +151,7 @@ func main() {
 		}
 
 	case "ps":
-		requireDaemon(clientErr, cmd)
-		resp, err := client.ListCurrentProcs()
+		resp, err := Daemon.Client.ListCurrentProcs()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
@@ -204,8 +187,7 @@ func main() {
 		}
 
 	case "du":
-		requireDaemon(clientErr, cmd)
-		resp, err := client.DiskUsage()
+		resp, err := Daemon.Client.DiskUsage()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
@@ -216,21 +198,19 @@ func main() {
 		fmt.Printf("  Free:  %s\n", formatBytes(resp.FreeBytes))
 
 	case "logs":
-		requireDaemon(clientErr, cmd)
-
 		logsFlags := flag.NewFlagSet("logs", flag.ExitOnError)
 		archiveFlag := logsFlags.Bool("new", false, "archive the current log file and start a fresh one")
 		logsFlags.Parse(os.Args[2:])
 
 		if *archiveFlag {
-			archivePath, err := client.ArchiveLogs()
+			archivePath, err := Daemon.Client.ArchiveLogs()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				os.Exit(1)
 			}
 			fmt.Printf("archived to: %s\n", archivePath)
 		} else {
-			if err := client.GetLogs(); err != nil {
+			if err := Daemon.Client.GetLogs(daemonizer.Wrap(os.Stdout)); err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				os.Exit(1)
 			}

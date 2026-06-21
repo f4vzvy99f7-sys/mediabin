@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/MaxDillon/daemonizer/daemon"
+	"github.com/f4vzvy99f7-sys/daemonizer"
 	vault "github.com/f4vzvy99f7-sys/vaultblob-go"
 )
 
@@ -48,351 +48,340 @@ type DiskUsageResp struct {
 }
 
 type MediabinDaemon struct {
-	RegisterNewDownload func(url string) error
+	RegisterNewDownload func(url string, stdout daemonizer.Writer) error
 	ListCurrentProcs    func() (ListCurrentProcsResp, error)
 	ListMedia           func(title_like string, tags []string) (ListMediaResp, error)
 	ListTags            func() ([]string, error)
 	DiskUsage           func() (DiskUsageResp, error)
-	GetLogs             func() error
+	GetLogs             func(stdout daemonizer.Writer) error
 	ArchiveLogs         func() (string, error)
 }
 
-func InitMediabin() (*MediabinDaemon, error) {
+var Daemon = daemonizer.Client("mediabin-go", func(ctx context.Context, impl *MediabinDaemon, config map[string]string) (daemonizer.CleanupFunc, error) {
+	logger := daemonizer.Logger()
 
-	return daemon.CreateClient[MediabinDaemon]("mediabin-go", func(h *daemon.Handlers) error {
-		logger := daemon.Logger()
+	passwd, ok := config["password"]
+	if !ok {
+		return nil, errors.New("no password")
+	}
+	datadir, ok := config["datadir"]
+	if !ok {
+		return nil, errors.New("no datadir")
+	}
 
-		passwd, ok := os.LookupEnv("DB_PASSWD")
-		if !ok {
-			return errors.New("no password")
+	ledgerpath := path.Join(datadir, "ledger")
+
+	if err := os.MkdirAll(datadir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create datadir: %w", err)
+	}
+
+	ledger, err := LoadFromFile(ledgerpath, passwd)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reset any entries left in "downloading" state from a previous daemon run
+	// back to "pending" so they get picked up again.
+	needsSync := false
+	for _, entry := range ledger.List() {
+		if entry.Status == "downloading" {
+			entry.Status = "pending"
+			ledger.Update(entry)
+			needsSync = true
+			logger.Printf("reset interrupted download to pending: %s", entry.ID)
 		}
-		datadir, ok := os.LookupEnv("DB_DATADIR")
-		if !ok {
-			return errors.New("no datadir")
+	}
+	if needsSync {
+		if err := ledger.SyncToFile(ledgerpath); err != nil {
+			return nil, fmt.Errorf("failed to sync ledger after restart reset: %w", err)
 		}
+	}
 
-		ledgerpath := path.Join(datadir, "ledger")
+	vaultDir := filepath.Join(datadir, "vault")
+	if err := os.MkdirAll(vaultDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create vault dir: %w", err)
+	}
+	mk := deriveVaultKey(passwd)
+	session, err := vault.OpenVault(vaultDir, mk, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open vault: %w", err)
+	}
 
-		if err := os.MkdirAll(datadir, 0755); err != nil {
-			return fmt.Errorf("failed to create datadir: %w", err)
-		}
+	serverCtx, cancelServerCtx := context.WithCancel(context.Background())
 
-		ledger, err := LoadFromFile(ledgerpath, passwd)
-		if err != nil {
-			return err
-		}
+	port := config["port"]
+	if port == "" {
+		port = "8080"
+	}
 
-		// Reset any entries left in "downloading" state from a previous daemon run
-		// back to "pending" so they get picked up again.
-		needsSync := false
-		for _, entry := range ledger.List() {
-			if entry.Status == "downloading" {
-				entry.Status = "pending"
-				ledger.Update(entry)
-				needsSync = true
-				logger.Printf("reset interrupted download to pending: %s", entry.ID)
-			}
-		}
-		if needsSync {
-			if err := ledger.SyncToFile(ledgerpath); err != nil {
-				return fmt.Errorf("failed to sync ledger after restart reset: %w", err)
-			}
-		}
+	downloader := NewDownloader(serverCtx, logger.Writer())
+	startHTTPServer(serverCtx, ledger, session, port, logger)
 
-		vaultDir := filepath.Join(datadir, "vault")
-		if err := os.MkdirAll(vaultDir, 0755); err != nil {
-			return fmt.Errorf("failed to create vault dir: %w", err)
-		}
-		mk := deriveVaultKey(passwd)
-		session, err := vault.OpenVault(vaultDir, mk, nil)
-		if err != nil {
-			return fmt.Errorf("failed to open vault: %w", err)
-		}
-
-		serverCtx, cancelServerCtx := context.WithCancel(context.Background())
-		h.OnShutdown(func(ctx context.Context) error {
-			cancelServerCtx()
-			return nil
-		})
-
-		h.OnShutdown(func(ctx context.Context) error {
-			logger.Println("shutting down...")
-			cancelServerCtx()
-			session.Close()
-			if err := ledger.SyncToFile(ledgerpath); err != nil {
-				logger.Printf("failed to sync ledger on shutdown: %v", err)
-				return err
-			}
-			return nil
-		})
-
-		port := os.Getenv("DB_PORT")
-		if port == "" {
-			port = "8080"
-		}
-
-		downloader := NewDownloader(serverCtx, logger.Writer())
-		startHTTPServer(serverCtx, ledger, session, port, logger)
-
-		go func() {
-			c := downloader.Subscribe()
-			for event := range c {
-				switch event.Status {
-				case StatusFinished:
-					entry, ok := ledger.Get(event.TaskID)
-					if !ok {
-						logger.Printf("download finished but entry not found: %s", event.TaskID)
-						continue
-					}
-					principleName, err := storeInVaultblob(session, entry.ID, event.TempDir)
-					if err != nil {
-						logger.Printf("failed to store download in vault: %v", err)
-						entry.Status = "error"
-						ledger.Update(entry)
-						if err := ledger.SyncToFile(ledgerpath); err != nil {
-							logger.Printf("failed to sync ledger after store error: %v", err)
-						}
-						continue
-					}
-					now := time.Now()
-					entry.Status = "complete"
-					entry.ObjectPath = principleName
-					entry.TimestampInstalled = &now
+	go func() {
+		c := downloader.Subscribe()
+		for event := range c {
+			switch event.Status {
+			case StatusFinished:
+				entry, ok := ledger.Get(event.TaskID)
+				if !ok {
+					logger.Printf("download finished but entry not found: %s", event.TaskID)
+					continue
+				}
+				principleName, err := storeInVaultblob(session, entry.ID, event.TempDir)
+				if err != nil {
+					logger.Printf("failed to store download in vault: %v", err)
+					entry.Status = "error"
 					ledger.Update(entry)
 					if err := ledger.SyncToFile(ledgerpath); err != nil {
-						logger.Printf("failed to sync ledger after completion: %v", err)
+						logger.Printf("failed to sync ledger after store error: %v", err)
 					}
-					logger.Printf("download completed and encrypted: %s", event.TaskID)
+					continue
+				}
+				now := time.Now()
+				entry.Status = "complete"
+				entry.ObjectPath = principleName
+				entry.TimestampInstalled = &now
+				ledger.Update(entry)
+				if err := ledger.SyncToFile(ledgerpath); err != nil {
+					logger.Printf("failed to sync ledger after completion: %v", err)
+				}
+				logger.Printf("download completed and encrypted: %s", event.TaskID)
 
-				case StatusError:
-					entry, ok := ledger.Get(event.TaskID)
-					if ok {
-						entry.Status = "error"
-						ledger.Update(entry)
-						if err := ledger.SyncToFile(ledgerpath); err != nil {
-							logger.Printf("failed to sync ledger after error: %v", err)
-						}
-						logger.Printf("download error: %s - %v", event.TaskID, event.Error)
+			case StatusError:
+				entry, ok := ledger.Get(event.TaskID)
+				if ok {
+					entry.Status = "error"
+					ledger.Update(entry)
+					if err := ledger.SyncToFile(ledgerpath); err != nil {
+						logger.Printf("failed to sync ledger after error: %v", err)
 					}
-				case StatusCancelled:
-					entry, ok := ledger.Get(event.TaskID)
-					if ok {
-						entry.Status = "error"
-						ledger.Update(entry)
-						if err := ledger.SyncToFile(ledgerpath); err != nil {
-							logger.Printf("failed to sync ledger after cancel: %v", err)
-						}
-						logger.Printf("download cancelled: %s", event.TaskID)
+					logger.Printf("download error: %s - %v", event.TaskID, event.Error)
+				}
+			case StatusCancelled:
+				entry, ok := ledger.Get(event.TaskID)
+				if ok {
+					entry.Status = "error"
+					ledger.Update(entry)
+					if err := ledger.SyncToFile(ledgerpath); err != nil {
+						logger.Printf("failed to sync ledger after cancel: %v", err)
 					}
+					logger.Printf("download cancelled: %s", event.TaskID)
 				}
 			}
-		}()
+		}
+	}()
 
-		go func() {
-			ticker := time.NewTicker(2 * time.Second)
-			defer ticker.Stop()
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
 
-			for {
-				select {
-				case <-serverCtx.Done():
-					return
-				case <-ticker.C:
-					entries := ledger.List()
-					for _, entry := range entries {
-						if entry.Status == "pending" {
-							if err := downloader.StartDownload(serverCtx, entry.ID, entry.OriginUrl); err != nil {
-								if errors.Is(err, ErrAlreadyDownloading) {
-									continue
-								}
-								logger.Printf("failed to start download %s: %v", entry.ID, err)
-								entry.Status = "error"
-								ledger.Update(entry)
-								if err := ledger.SyncToFile(ledgerpath); err != nil {
-									logger.Printf("failed to sync ledger after dispatch error: %v", err)
-								}
+		for {
+			select {
+			case <-serverCtx.Done():
+				return
+			case <-ticker.C:
+				entries := ledger.List()
+				for _, entry := range entries {
+					if entry.Status == "pending" {
+						if err := downloader.StartDownload(serverCtx, entry.ID, entry.OriginUrl); err != nil {
+							if errors.Is(err, ErrAlreadyDownloading) {
 								continue
 							}
-							entry.Status = "downloading"
+							logger.Printf("failed to start download %s: %v", entry.ID, err)
+							entry.Status = "error"
 							ledger.Update(entry)
-							logger.Printf("started download: %s", entry.ID)
+							if err := ledger.SyncToFile(ledgerpath); err != nil {
+								logger.Printf("failed to sync ledger after dispatch error: %v", err)
+							}
+							continue
 						}
+						entry.Status = "downloading"
+						ledger.Update(entry)
+						logger.Printf("started download: %s", entry.ID)
 					}
 				}
 			}
-		}()
+		}
+	}()
 
-		h.Handle("RegisterNewDownload", func(ctx context.Context, url string) error {
-			stdout := daemon.Stdout(ctx)
-			info, err := downloader.FetchInfo(ctx, url)
-			if err != nil {
-				logger.Printf("error fetching info: %v", err)
-				return err
-			}
-
-			if _, exists := ledger.Get(info.MbIdentifier); exists {
-				fmt.Fprintf(stdout, "%s is already downloaded or is currently in the queue\n", url)
-				return nil
-			}
-
-			fmt.Fprintf(stdout, "Queued: %s\n", info.Title)
-			logger.Printf("Title: %s\n Url: %s\n", info.Title, info.WebpageURL)
-
-			entry := MediaEntry{
-				ID:           info.MbIdentifier,
-				Title:        info.Title,
-				OriginUrl:    info.WebpageURL,
-				VideoUrl:     info.URL,
-				ThumbnailUrl: info.Thumbnail,
-				ObjectPath:   "", // will be set after download
-				Status:       "pending",
-				Tags:         []string{},
-			}
-
-			if info.Uploader != "" {
-				entry.Tags = append(entry.Tags, "studio:"+normalizeTagValue(info.Uploader))
-			}
-			for _, actor := range info.Cast {
-				entry.Tags = append(entry.Tags, "actor:"+normalizeTagValue(actor))
-			}
-
-			ledger.Add(entry)
-			if err := ledger.SyncToFile(ledgerpath); err != nil {
-				logger.Printf("failed to sync ledger after register: %v", err)
-				return err
-			}
-			return nil
-		})
-
-		h.Handle("ListCurrentProcs", func(ctx context.Context) (ListCurrentProcsResp, error) {
-			activeTasks := downloader.GetActiveTasks()
-			activeByID := make(map[string]TaskSnapshot, len(activeTasks))
-			for _, t := range activeTasks {
-				activeByID[t.ID] = t
-			}
-
-			var procs []ProcessInfo
-
-			for _, t := range activeTasks {
-				title := t.Title
-				if title == "" {
-					if entry, ok := ledger.Get(t.ID); ok {
-						title = entry.Title
-					}
-				}
-				procs = append(procs, ProcessInfo{
-					ID:        t.ID,
-					Title:     title,
-					Status:    string(t.Status),
-					Percent:   t.Percent,
-					Speed:     t.Speed,
-					Eta:       t.Eta,
-					IsPending: false,
-				})
-			}
-
-			for _, entry := range ledger.List() {
-				if entry.Status != "pending" {
-					continue
-				}
-				if _, active := activeByID[entry.ID]; active {
-					continue
-				}
-				procs = append(procs, ProcessInfo{
-					ID:        entry.ID,
-					Title:     entry.Title,
-					IsPending: true,
-				})
-			}
-
-			return ListCurrentProcsResp{Processes: procs}, nil
-		})
-
-		h.Handle("ListMedia", func(ctx context.Context, title_like string, tags []string) (ListMediaResp, error) {
-			entries := ledger.List()
-			var result []MediaInfo
-			title_lower := strings.ToLower(title_like)
-
-			for _, entry := range entries {
-				if entry.Status != "complete" {
-					continue
-				}
-				if title_like != "" && !strings.Contains(strings.ToLower(entry.Title), title_lower) {
-					continue
-				}
-				if len(tags) > 0 {
-					matched := false
-					for _, tag := range tags {
-						if slices.Contains(entry.Tags, tag) {
-							matched = true
-						}
-						if matched {
-							break
-						}
-					}
-					if !matched {
-						continue
-					}
-				}
-				result = append(result, MediaInfo{
-					ID:    entry.ID,
-					Title: entry.Title,
-				})
-			}
-
-			return ListMediaResp{Media: result}, nil
-		})
-
-		h.Handle("ListTags", func(ctx context.Context) ([]string, error) {
-			entries := ledger.List()
-			tagSet := make(map[string]bool)
-			for _, entry := range entries {
-				for _, tag := range entry.Tags {
-					tagSet[tag] = true
-				}
-			}
-			tags := make([]string, 0, len(tagSet))
-			for tag := range tagSet {
-				tags = append(tags, tag)
-			}
-			return tags, nil
-		})
-
-		h.Handle("DiskUsage", func(ctx context.Context) (DiskUsageResp, error) {
-			var stat syscall.Statfs_t
-			if err := syscall.Statfs(datadir, &stat); err != nil {
-				return DiskUsageResp{}, fmt.Errorf("statfs failed: %w", err)
-			}
-			total := stat.Blocks * uint64(stat.Bsize)
-			free := stat.Bfree * uint64(stat.Bsize)
-			return DiskUsageResp{
-				Path:       datadir,
-				TotalBytes: total,
-				UsedBytes:  total - free,
-				FreeBytes:  free,
-			}, nil
-		})
-
-		h.Handle("GetLogs", func(ctx context.Context) error {
-			path := daemon.LogPath()
-			if path == "" {
-				return errors.New("log path unavailable")
-			}
-			f, err := os.Open(path)
-			if err != nil {
-				return fmt.Errorf("failed to open log file: %w", err)
-			}
-			defer f.Close()
-			_, err = io.Copy(daemon.Stdout(ctx), f)
+	impl.RegisterNewDownload = func(url string, stdout daemonizer.Writer) error {
+		info, err := downloader.FetchInfo(ctx, url)
+		if err != nil {
+			logger.Printf("error fetching info: %v", err)
 			return err
-		})
+		}
 
-		h.Handle("ArchiveLogs", func(ctx context.Context) (string, error) {
-			return daemon.ArchiveLog()
-		})
+		if _, exists := ledger.Get(info.MbIdentifier); exists {
+			fmt.Fprintf(stdout, "%s is already downloaded or is currently in the queue\n", url)
+			return nil
+		}
 
+		fmt.Fprintf(stdout, "Queued: %s\n", info.Title)
+		logger.Printf("Title: %s\n Url: %s\n", info.Title, info.WebpageURL)
+
+		entry := MediaEntry{
+			ID:           info.MbIdentifier,
+			Title:        info.Title,
+			OriginUrl:    info.WebpageURL,
+			VideoUrl:     info.URL,
+			ThumbnailUrl: info.Thumbnail,
+			ObjectPath:   "", // will be set after download
+			Status:       "pending",
+			Tags:         []string{},
+		}
+
+		if info.Uploader != "" {
+			entry.Tags = append(entry.Tags, "studio:"+normalizeTagValue(info.Uploader))
+		}
+		for _, actor := range info.Cast {
+			entry.Tags = append(entry.Tags, "actor:"+normalizeTagValue(actor))
+		}
+
+		ledger.Add(entry)
+		if err := ledger.SyncToFile(ledgerpath); err != nil {
+			logger.Printf("failed to sync ledger after register: %v", err)
+			return err
+		}
 		return nil
-	})
-}
+	}
+
+	impl.ListCurrentProcs = func() (ListCurrentProcsResp, error) {
+		activeTasks := downloader.GetActiveTasks()
+		activeByID := make(map[string]TaskSnapshot, len(activeTasks))
+		for _, t := range activeTasks {
+			activeByID[t.ID] = t
+		}
+
+		var procs []ProcessInfo
+
+		for _, t := range activeTasks {
+			title := t.Title
+			if title == "" {
+				if entry, ok := ledger.Get(t.ID); ok {
+					title = entry.Title
+				}
+			}
+			procs = append(procs, ProcessInfo{
+				ID:        t.ID,
+				Title:     title,
+				Status:    string(t.Status),
+				Percent:   t.Percent,
+				Speed:     t.Speed,
+				Eta:       t.Eta,
+				IsPending: false,
+			})
+		}
+
+		for _, entry := range ledger.List() {
+			if entry.Status != "pending" {
+				continue
+			}
+			if _, active := activeByID[entry.ID]; active {
+				continue
+			}
+			procs = append(procs, ProcessInfo{
+				ID:        entry.ID,
+				Title:     entry.Title,
+				IsPending: true,
+			})
+		}
+
+		return ListCurrentProcsResp{Processes: procs}, nil
+	}
+
+	impl.ListMedia = func(title_like string, tags []string) (ListMediaResp, error) {
+		entries := ledger.List()
+		var result []MediaInfo
+		title_lower := strings.ToLower(title_like)
+
+		for _, entry := range entries {
+			if entry.Status != "complete" {
+				continue
+			}
+			if title_like != "" && !strings.Contains(strings.ToLower(entry.Title), title_lower) {
+				continue
+			}
+			if len(tags) > 0 {
+				matched := false
+				for _, tag := range tags {
+					if slices.Contains(entry.Tags, tag) {
+						matched = true
+					}
+					if matched {
+						break
+					}
+				}
+				if !matched {
+					continue
+				}
+			}
+			result = append(result, MediaInfo{
+				ID:    entry.ID,
+				Title: entry.Title,
+			})
+		}
+
+		return ListMediaResp{Media: result}, nil
+	}
+
+	impl.ListTags = func() ([]string, error) {
+		entries := ledger.List()
+		tagSet := make(map[string]bool)
+		for _, entry := range entries {
+			for _, tag := range entry.Tags {
+				tagSet[tag] = true
+			}
+		}
+		tags := make([]string, 0, len(tagSet))
+		for tag := range tagSet {
+			tags = append(tags, tag)
+		}
+		return tags, nil
+	}
+
+	impl.DiskUsage = func() (DiskUsageResp, error) {
+		var stat syscall.Statfs_t
+		if err := syscall.Statfs(datadir, &stat); err != nil {
+			return DiskUsageResp{}, fmt.Errorf("statfs failed: %w", err)
+		}
+		total := stat.Blocks * uint64(stat.Bsize)
+		free := stat.Bfree * uint64(stat.Bsize)
+		return DiskUsageResp{
+			Path:       datadir,
+			TotalBytes: total,
+			UsedBytes:  total - free,
+			FreeBytes:  free,
+		}, nil
+	}
+
+	impl.GetLogs = func(stdout daemonizer.Writer) error {
+		path := daemonizer.LogPath()
+		if path == "" {
+			return errors.New("log path unavailable")
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("failed to open log file: %w", err)
+		}
+		defer f.Close()
+		_, err = io.Copy(stdout, f)
+		return err
+	}
+
+	impl.ArchiveLogs = func() (string, error) {
+		return daemonizer.ArchiveLog()
+	}
+
+	return func() {
+		logger.Println("shutting down...")
+		cancelServerCtx()
+		session.Close()
+		if err := ledger.SyncToFile(ledgerpath); err != nil {
+			logger.Printf("failed to sync ledger on shutdown: %v", err)
+			return
+		}
+	}, nil
+})
 
 func normalizeTagValue(s string) string {
 	return strings.ToLower(strings.ReplaceAll(s, " ", "_"))
