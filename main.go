@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"os"
@@ -95,6 +96,23 @@ func main() {
 		if err := Daemon.Client.RegisterNewDownload(url, daemonizer.Wrap(os.Stdout)); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
+		}
+	case "shell":
+		scanner := bufio.NewScanner(os.Stdin)
+		fmt.Print("> ")
+		for scanner.Scan() {
+			url := scanner.Text()
+			if url == "" {
+				fmt.Print("> ")
+				continue
+			}
+			if err := Daemon.Client.RegisterNewDownload(url, daemonizer.Wrap(os.Stdout)); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			}
+			fmt.Print("> ")
+		}
+		if err := scanner.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "error reading input: %v\n", err)
 		}
 
 	case "ls":
