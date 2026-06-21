@@ -5,7 +5,7 @@ go 1.26
 require (
 	filippo.io/age v1.3.1
 	github.com/f4vzvy99f7-sys/daemonizer v0.0.1
-	github.com/f4vzvy99f7-sys/vaultblob-go v0.1.12
+	github.com/f4vzvy99f7-sys/vaultblob-go v0.1.14
 	golang.org/x/crypto v0.49.0
 	golang.org/x/sys v0.42.0
 	golang.org/x/term v0.41.0
